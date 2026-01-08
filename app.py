@@ -61,6 +61,8 @@ RÈGLES DE GESTION DES DATES (ALGORITHME) :
 
 3. **Défaut** : Si aucune date n'est précisée, utilise `LAST_30_DAYS`.
 
+4. 1. **FOCUS ACTIVITÉ** : Ne regarde jamais les éléments (campagnes, groupes, pubs) qui sont en pause, supprimés ou qui ne diffusent pas.
+
 RÈGLES D'ANALYSE :
 - Divise toujours `metrics.cost_micros` par 1 000 000.
 - Ne donne pas juste un tableau. **Explique** les chiffres. Cherche les causes (CPC ? CTR ?).
