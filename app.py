@@ -3,6 +3,7 @@ import sys
 import json
 import asyncio
 import subprocess
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import streamlit as st
@@ -15,12 +16,9 @@ from mcp.client.stdio import stdio_client, StdioServerParameters
 # 1. CHARGEMENT SÉCURISÉ DES SECRETS
 # ======================
 try:
-    # Récupération des clés depuis secrets.toml
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
     MCP_SCRIPT_PATH = st.secrets["script_path"]
     
-    # Construction du dictionnaire pour l'environnement du script
-    # On mappe les clés du TOML vers les variables d'environnement attendues par server_ads.py
     ADS_CREDENTIALS = {
         "GOOGLE_ADS_DEVELOPER_TOKEN": st.secrets["google_ads"]["developer_token"],
         "GOOGLE_ADS_LOGIN_CUSTOMER_ID": st.secrets["google_ads"]["login_customer_id"],
@@ -32,24 +30,49 @@ try:
     
     GEMINI_MODEL = "gemini-2.5-flash"
 
-except FileNotFoundError:
-    st.error("❌ Fichier `.streamlit/secrets.toml` introuvable.")
-    st.stop()
-except KeyError as e:
-    st.error(f"❌ Clé manquante dans secrets.toml : {e}")
+except (FileNotFoundError, KeyError):
+    st.error("❌ ERREUR SÉCURITÉ : Fichier secrets.toml introuvable ou incomplet.")
     st.stop()
 
 # ======================
-# 2. STYLE & CONFIGURATION
+# 2. LE CERVEAU (L'AMÉLIORATION EST ICI 🧠)
+# ======================
+CURRENT_DATE = datetime.now().strftime("%d %B %Y")
+
+SYSTEM_INSTRUCTION = f"""
+CONTEXTE TEMPOREL :
+Nous sommes le : {CURRENT_DATE}. (Prends cette date comme référence absolue).
+Compte analysé : {ADS_CREDENTIALS['GOOGLE_ADS_CUSTOMER_ID']}
+
+TON RÔLE :
+Tu es un Analyste Senior Google Ads. Tu ne devines rien, tu vérifies tout via l'outil `search_google_ads`.
+
+RÈGLES TECHNIQUES (GAQL) :
+1. DATES : Utilise TOUJOURS des segments dynamiques :
+   - `segments.date DURING LAST_30_DAYS` (Défaut)
+   - `segments.date DURING THIS_MONTH`
+   - Ne calcule JAMAIS de dates "en dur" (ex: '2024-01-01') sauf demande explicite.
+2. ARGENT : Les champs `cost_micros` doivent être divisés par 1 000 000.
+3. JOINTURES : Google Ads ne fait pas de JOIN. Tout est dans les vues :
+   - Campagnes : `campaign`
+   - Groupes : `ad_group`
+   - Mots-clés : `keyword_view`
+   - Termes de recherche : `search_term_view`
+   - Performances globales : `customer`
+
+COMPORTEMENT :
+- Si une requête renvoie 0 résultat, dis-le clairement ("Aucune donnée sur cette période").
+- Si l'utilisateur demande une analyse, commence par récupérer les chiffres clés avant de donner ton avis.
+"""
+
+# ======================
+# 3. STYLE & UI
 # ======================
 st.set_page_config(page_title="Ad's up — GAds Chat", page_icon="⚡", layout="wide")
 st.markdown("""
 <style>
-/* Style épuré sans header blanc */
 [data-testid="stHeader"] { background: transparent !important; }
 .block-container { padding-top: 1rem !important; }
-
-/* Hero Banner */
 .hero {
   border: 1px solid #374151; border-radius: 16px; padding: 18px 18px;
   background: linear-gradient(135deg, #1e3a8a 0%, #0f172a 35%, #111827 100%);
@@ -64,8 +87,6 @@ st.markdown("""
   display:inline-block; padding:4px 10px; border-radius:999px;
   background:#1f2937; border:1px solid #374151; font-size:12px; color:#e5e7eb; margin-right:6px;
 }
-
-/* Zone Chat */
 .glass {
   background: rgba(17, 24, 39, 0.7);
   border: 1px solid rgba(75, 85, 99, 0.4);
@@ -77,7 +98,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ======================
-# 3. HELPERS TECHNIQUES
+# 4. HELPERS TECHNIQUES
 # ======================
 def extract_text(resp) -> str:
     if getattr(resp, "text", None): return resp.text
@@ -110,24 +131,26 @@ def trim_history(msgs: List[gt.Content], keep_last: int = 20):
     if len(msgs) > keep_last: del msgs[:-keep_last]
 
 # ======================
-# 4. CONFIGURATION MCP
+# 5. CONFIGURATION MCP
 # ======================
 def _build_server_params() -> StdioServerParameters:
     if not os.path.exists(MCP_SCRIPT_PATH):
+        # Fallback Cloud (si chemin relatif)
+        if os.path.exists("server_ads.py"):
+             return StdioServerParameters(command=sys.executable, args=["-u", "server_ads.py"], env=ADS_CREDENTIALS)
         st.error(f"❌ Script introuvable : `{MCP_SCRIPT_PATH}`")
-        st.info("💡 Conseil : Vérifiez le chemin dans secrets.toml > [paths] > script_path")
         st.stop()
         
     return StdioServerParameters(
         command=sys.executable, 
         args=["-u", MCP_SCRIPT_PATH], 
-        env=ADS_CREDENTIALS, # Les clés chargées depuis secrets.toml
+        env=ADS_CREDENTIALS,
     )
 
 SERVER_PARAMS = _build_server_params()
 
 # ======================
-# 5. CHARGEMENT ASYNC DES OUTILS
+# 6. CHARGEMENT ASYNC
 # ======================
 async def list_mcp_tools() -> List[gt.Tool]:
     try:
@@ -149,7 +172,7 @@ async def list_mcp_tools() -> List[gt.Tool]:
         return []
 
 # ======================
-# 6. MOTEUR DE CHAT (Un Tour)
+# 7. MOTEUR DE CHAT (INTELLIGENT)
 # ======================
 async def run_one_turn(user_q: str, tools: List[gt.Tool], client: genai.Client) -> str:
     st.session_state.messages.append(as_user(user_q))
@@ -158,37 +181,42 @@ async def run_one_turn(user_q: str, tools: List[gt.Tool], client: genai.Client) 
         async with ClientSession(read, write) as session:
             await session.initialize()
 
-            # 1. Appel Gemini avec Outils
+            # 1. Appel Gemini AVEC L'INSTRUCTION SYSTÈME
             resp = client.models.generate_content(
                 model=GEMINI_MODEL,
                 contents=st.session_state.messages,
-                config=gt.GenerateContentConfig(temperature=0.3, tools=tools),
+                config=gt.GenerateContentConfig(
+                    temperature=0.3, 
+                    tools=tools,
+                    system_instruction=SYSTEM_INSTRUCTION # <--- C'est ici que l'IA devient intelligente
+                ),
             )
 
             call = extract_tool_call(resp)
             
-            # Pas d'outil ? On renvoie le texte direct
             if not call:
                 text = extract_text(resp) or "(pas de réponse)"
                 st.session_state.messages.append(as_model_text(text))
                 trim_history(st.session_state.messages)
                 return text
 
-            # 2. Exécution Outil (Silencieuse)
+            # 2. Exécution Outil
             st.session_state.messages.append(as_model_call(call))
-            # (Pas d'affichage "Exécution en cours" ici)
-
+            
             args = dict(call.args or {})
             result = await session.call_tool(call.name, args)
             raw = result.content[0].text if result.content else "{}"
             
             st.session_state.messages.append(as_tool_resp(call.name, raw))
 
-            # 3. Synthèse Finale
+            # 3. Synthèse Finale (Toujours avec l'instruction système pour garder le contexte)
             resp2 = client.models.generate_content(
                 model=GEMINI_MODEL,
                 contents=st.session_state.messages,
-                config=gt.GenerateContentConfig(temperature=0.7),
+                config=gt.GenerateContentConfig(
+                    temperature=0.7,
+                    system_instruction=SYSTEM_INSTRUCTION
+                ),
             )
             final_text = extract_text(resp2) or "(aucun texte)"
             st.session_state.messages.append(as_model_text(final_text))
@@ -196,30 +224,26 @@ async def run_one_turn(user_q: str, tools: List[gt.Tool], client: genai.Client) 
             return final_text
 
 # ======================
-# 7. INTERFACE PRINCIPALE
+# 8. INTERFACE PRINCIPALE
 # ======================
 
-# Header
 st.markdown(f"""
 <div class="hero">
   <div class="brand">Google Ads Analyzer</div>
   <div style="color:#94a3b8; margin-top:4px; font-weight:600; font-size: 0.9em;">
-    Pilotage de campagnes via Gemini Flash & MCP Local
+    Pilotage Expert via Gemini Flash & MCP
   </div>
   <div class="chips" style="margin-top:10px;">
-    <span>Gemini 2.5</span><span>Compte: {ADS_CREDENTIALS['GOOGLE_ADS_CUSTOMER_ID']}</span>
+    <span>Date: {CURRENT_DATE}</span><span>Compte: {ADS_CREDENTIALS['GOOGLE_ADS_CUSTOMER_ID']}</span>
   </div>
 </div>
 """, unsafe_allow_html=True)
 
-# Initialisation Session
 if "history" not in st.session_state: st.session_state.history = []
 if "messages" not in st.session_state: st.session_state.messages = []
 
-# Client Gemini
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Chargement Outils (Cache)
 @st.cache_resource
 def _load_tools():
     return asyncio.run(list_mcp_tools())
@@ -230,25 +254,20 @@ except Exception as e:
     st.error(f"Impossible de charger les outils : {e}")
     st.stop()
 
-# Zone Chat
 st.markdown('<div class="glass">', unsafe_allow_html=True)
 
-# Affichage des messages passés
 for role, msg in st.session_state.history:
     with st.chat_message("user" if role == "user" else "assistant"):
         st.markdown(msg)
 
-# Input
-user_q = st.chat_input("Ex: Coûts et Conversions des campagnes PMAX sur 30 jours ?")
+user_q = st.chat_input("Ex: Audit des mots-clés les plus coûteux sans conversions ?")
 
 if user_q:
-    # User message
     st.session_state.history.append(("user", user_q))
     with st.chat_message("user"):
         st.markdown(user_q)
         
-    # Assistant response
-    with st.spinner("Analyse..."):
+    with st.spinner("Analyse expert..."):
         try:
             answer = asyncio.run(run_one_turn(user_q, tools, client))
         except Exception as e:
