@@ -13,7 +13,7 @@ from mcp import ClientSession
 from mcp.client.stdio import stdio_client, StdioServerParameters
 
 # ======================
-# 1. CHARGEMENT SÉCURISÉ DES SECRETS
+# 1. CONFIGURATION SÉCURISÉE
 # ======================
 try:
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
@@ -35,40 +35,37 @@ except (FileNotFoundError, KeyError):
     st.stop()
 
 # ======================
-# 2. LE CERVEAU (L'AMÉLIORATION EST ICI 🧠)
+# 2. CERVEAU DU CONSULTANT (Stratège & Autonome)
 # ======================
 CURRENT_DATE = datetime.now().strftime("%d %B %Y")
 
 SYSTEM_INSTRUCTION = f"""
-CONTEXTE TEMPOREL :
-Nous sommes le : {CURRENT_DATE}. (Prends cette date comme référence absolue).
-Compte analysé : {ADS_CREDENTIALS['GOOGLE_ADS_CUSTOMER_ID']}
+CONTEXTE :
+Date du jour : {CURRENT_DATE}.
+Compte cible : {ADS_CREDENTIALS['GOOGLE_ADS_CUSTOMER_ID']}
 
 TON RÔLE :
-Tu es un Analyste Senior Google Ads. Tu ne devines rien, tu vérifies tout via l'outil `search_google_ads`.
+Tu es le **Stratège et Interprète** du compte Google Ads.
+L'utilisateur te pose des questions métier. Ta mission est de trouver la preuve dans les données et d'expliquer ce qu'il se passe.
 
-RÈGLES TECHNIQUES (GAQL) :
-1. DATES : Utilise TOUJOURS des segments dynamiques :
-   - `segments.date DURING LAST_30_DAYS` (Défaut)
-   - `segments.date DURING THIS_MONTH`
-   - Ne calcule JAMAIS de dates "en dur" (ex: '2024-01-01') sauf demande explicite.
-2. ARGENT : Les champs `cost_micros` doivent être divisés par 1 000 000.
-3. JOINTURES : Google Ads ne fait pas de JOIN. Tout est dans les vues :
-   - Campagnes : `campaign`
-   - Groupes : `ad_group`
-   - Mots-clés : `keyword_view`
-   - Termes de recherche : `search_term_view`
-   - Performances globales : `customer`
+TA MÉTHODOLOGIE (LIBERTÉ TOTALE) :
+1. **INVESTIGATION** : Utilise l'outil `search_google_ads` comme tu l'entends. Tu es libre de choisir les champs, les filtres et les périodes qui te semblent pertinents pour répondre.
+2. **ADAPTATION** :
+   - Si on demande "semaine dernière", "7 jours", "hier", tu es LIBRE d'utiliser les segments dynamiques (`LAST_7_DAYS`) ou de calculer les dates.
+   - Si on demande "30 jours", utilise `LAST_30_DAYS`.
+3. **INTERPRÉTATION (Crucial)** :
+   - Ne te contente pas d'afficher un tableau de chiffres bruts.
+   - **Raconte l'histoire** : "Le coût a augmenté car le CPC a doublé", "La campagne X porte tout le compte".
+   - Convertis toujours les `cost_micros` en devise réelle (divisé par 1M).
 
-COMPORTEMENT :
-- Si une requête renvoie 0 résultat, dis-le clairement ("Aucune donnée sur cette période").
-- Si l'utilisateur demande une analyse, commence par récupérer les chiffres clés avant de donner ton avis.
+CAS D'ERREUR :
+Si l'outil renvoie "Aucun résultat", ne dis pas juste "Il n'y a rien". Propose une hypothèse (ex: "Campagne en pause ? Période trop courte ?").
 """
 
 # ======================
-# 3. STYLE & UI
+# 3. STYLE & UI (Épuré)
 # ======================
-st.set_page_config(page_title="Ad's up — GAds Chat", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="Ad's up — GAds Agent", page_icon="⚡", layout="wide")
 st.markdown("""
 <style>
 [data-testid="stHeader"] { background: transparent !important; }
@@ -172,56 +169,64 @@ async def list_mcp_tools() -> List[gt.Tool]:
         return []
 
 # ======================
-# 7. MOTEUR DE CHAT (INTELLIGENT)
+# 7. MOTEUR DE CHAT (Boucle Silencieuse)
 # ======================
-async def run_one_turn(user_q: str, tools: List[gt.Tool], client: genai.Client) -> str:
+async def run_agent_turn(user_q: str, client: genai.Client) -> str:
+    # 1. Ajout message user
     st.session_state.messages.append(as_user(user_q))
 
+    # Connexion MCP
     async with stdio_client(SERVER_PARAMS) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
-
-            # 1. Appel Gemini AVEC L'INSTRUCTION SYSTÈME
-            resp = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=st.session_state.messages,
-                config=gt.GenerateContentConfig(
-                    temperature=0.3, 
-                    tools=tools,
-                    system_instruction=SYSTEM_INSTRUCTION # <--- C'est ici que l'IA devient intelligente
-                ),
-            )
-
-            call = extract_tool_call(resp)
             
-            if not call:
-                text = extract_text(resp) or "(pas de réponse)"
-                st.session_state.messages.append(as_model_text(text))
-                trim_history(st.session_state.messages)
-                return text
+            # Récupération des outils pour ce tour
+            tl = await session.list_tools()
+            tools_def = [
+                gt.Tool(function_declarations=[{
+                    "name": t.name,
+                    "description": t.description or "",
+                    "parameters": {"type": "object", "properties": {}},
+                }]) for t in tl.tools
+            ]
 
-            # 2. Exécution Outil
-            st.session_state.messages.append(as_model_call(call))
-            
-            args = dict(call.args or {})
-            result = await session.call_tool(call.name, args)
-            raw = result.content[0].text if result.content else "{}"
-            
-            st.session_state.messages.append(as_tool_resp(call.name, raw))
+            # 2. Boucle de réflexion (Max 5 étapes)
+            for _ in range(5):
+                
+                # A. Gemini Réfléchit
+                resp = client.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=st.session_state.messages,
+                    config=gt.GenerateContentConfig(
+                        temperature=0.3, 
+                        tools=tools_def,
+                        system_instruction=SYSTEM_INSTRUCTION
+                    ),
+                )
 
-            # 3. Synthèse Finale (Toujours avec l'instruction système pour garder le contexte)
-            resp2 = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=st.session_state.messages,
-                config=gt.GenerateContentConfig(
-                    temperature=0.7,
-                    system_instruction=SYSTEM_INSTRUCTION
-                ),
-            )
-            final_text = extract_text(resp2) or "(aucun texte)"
-            st.session_state.messages.append(as_model_text(final_text))
-            trim_history(st.session_state.messages)
-            return final_text
+                call = extract_tool_call(resp)
+                
+                # B. Si Gemini répond (pas d'outil), c'est fini
+                if not call:
+                    text = extract_text(resp)
+                    st.session_state.messages.append(as_model_text(text))
+                    trim_history(st.session_state.messages)
+                    return text
+
+                # C. Exécution Outil (Silencieuse - Pas d'affichage UI)
+                st.session_state.messages.append(as_model_call(call))
+                
+                args = dict(call.args or {})
+                try:
+                    result = await session.call_tool(call.name, args)
+                    raw = result.content[0].text if result.content else "Aucune donnée."
+                except Exception as e:
+                    raw = f"Erreur outil: {str(e)}"
+                
+                # D. On renvoie le résultat à l'IA pour qu'elle continue
+                st.session_state.messages.append(as_tool_resp(call.name, raw))
+            
+            return "Je n'ai pas réussi à conclure après plusieurs recherches."
 
 # ======================
 # 8. INTERFACE PRINCIPALE
@@ -244,16 +249,7 @@ if "messages" not in st.session_state: st.session_state.messages = []
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-@st.cache_resource
-def _load_tools():
-    return asyncio.run(list_mcp_tools())
-
-try:
-    tools = _load_tools()
-except Exception as e:
-    st.error(f"Impossible de charger les outils : {e}")
-    st.stop()
-
+# Zone Chat
 st.markdown('<div class="glass">', unsafe_allow_html=True)
 
 for role, msg in st.session_state.history:
@@ -269,9 +265,9 @@ if user_q:
         
     with st.spinner("Analyse expert..."):
         try:
-            answer = asyncio.run(run_one_turn(user_q, tools, client))
+            answer = asyncio.run(run_agent_turn(user_q, client))
         except Exception as e:
-            answer = f"❌ Erreur : {e}"
+            answer = f"❌ Erreur critique : {e}"
             
     st.session_state.history.append(("assistant", answer))
     with st.chat_message("assistant"):
