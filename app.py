@@ -36,7 +36,7 @@ except (FileNotFoundError, KeyError):
     st.stop()
 
 # ======================
-# 2. CERVEAU "SMART DATES"
+# 2. CERVEAU "SMART DATES" (VOTRE PROMPT DE BASE)
 # ======================
 CURRENT_DATE = datetime.now().strftime("%Y-%m-%d")
 
