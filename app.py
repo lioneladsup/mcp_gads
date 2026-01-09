@@ -5,6 +5,7 @@ import asyncio
 import subprocess
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
+import re
 
 import streamlit as st
 from google import genai
@@ -35,9 +36,9 @@ except (FileNotFoundError, KeyError):
     st.stop()
 
 # ======================
-# 2. CERVEAU "SMART DATES" (La mise à jour est ici 🧠)
+# 2. CERVEAU "SMART DATES"
 # ======================
-CURRENT_DATE = datetime.now().strftime("%Y-%m-%d") # Format ISO pour aider l'IA
+CURRENT_DATE = datetime.now().strftime("%Y-%m-%d")
 
 SYSTEM_INSTRUCTION = f"""
 CONTEXTE :
@@ -175,73 +176,91 @@ async def list_mcp_tools() -> List[gt.Tool]:
                 ]
                 return tools
     except Exception as e:
-        st.error(f"Erreur connexion MCP : {e}")
         return []
 
 # ======================
-# 7. MOTEUR AGENTIQUE (Boucle Intelligente)
+# 7. MOTEUR AGENTIQUE (AUTO-RESTART INTÉGRÉ) 🔄
 # ======================
 async def run_agent_turn(user_q: str, client: genai.Client) -> str:
     st.session_state.messages.append(as_user(user_q))
 
-    async with stdio_client(SERVER_PARAMS) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            tl = await session.list_tools()
-            tools_def = [
-                gt.Tool(function_declarations=[{
-                    "name": t.name,
-                    "description": t.description or "",
-                    "parameters": {"type": "object", "properties": {}},
-                }]) for t in tl.tools
-            ]
+    # --- MÉCANISME DE REDÉMARRAGE AUTOMATIQUE ---
+    MAX_RETRIES = 3
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            # On crée une nouvelle connexion à chaque tentative
+            async with stdio_client(SERVER_PARAMS) as (read, write):
+                async with ClientSession(read, write) as session:
+                    
+                    await session.initialize()
+                    tl = await session.list_tools()
+                    
+                    tools_def = [
+                        gt.Tool(function_declarations=[{
+                            "name": t.name,
+                            "description": t.description or "",
+                            "parameters": {"type": "object", "properties": {}},
+                        }]) for t in tl.tools
+                    ]
 
-            # Boucle de réflexion (5 itérations max)
-            for _ in range(5):
-                
-                resp = client.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=st.session_state.messages,
-                    config=gt.GenerateContentConfig(
-                        temperature=0.3, # Créativité basse pour la rigueur SQL
-                        tools=tools_def,
-                        system_instruction=SYSTEM_INSTRUCTION
-                    ),
-                )
+                    # Boucle de réflexion (5 étapes max)
+                    for _ in range(5):
+                        
+                        resp = client.models.generate_content(
+                            model=GEMINI_MODEL,
+                            contents=st.session_state.messages,
+                            config=gt.GenerateContentConfig(
+                                temperature=0.3, 
+                                tools=tools_def,
+                                system_instruction=SYSTEM_INSTRUCTION
+                            ),
+                        )
 
-                call = extract_tool_call(resp)
-                
-                if not call:
-                    text = extract_text(resp)
-                    st.session_state.messages.append(as_model_text(text))
-                    trim_history(st.session_state.messages)
-                    return text
+                        call = extract_tool_call(resp)
+                        
+                        if not call:
+                            text = extract_text(resp)
+                            st.session_state.messages.append(as_model_text(text))
+                            trim_history(st.session_state.messages)
+                            return text
 
-                st.session_state.messages.append(as_model_call(call))
-                
-                # --- MOUCHARD DEBUG (Visible pour vous) ---
-                args = dict(call.args or {})
-                with st.chat_message("assistant"):
-                    with st.expander(f"🛠️ Debug Requête : {call.name}", expanded=False):
-                        if "query" in args:
-                            st.code(args["query"], language="sql")
-                        else:
-                            st.json(args)
-                
-                try:
-                    result = await session.call_tool(call.name, args)
-                    raw = result.content[0].text if result.content else "Aucune donnée."
-                except Exception as e:
-                    raw = f"Erreur outil: {str(e)}"
-                
-                # --- MOUCHARD RÉSULTAT (Visible pour vous) ---
-                with st.chat_message("assistant"):
-                    with st.expander("📊 Debug Réponse brute", expanded=False):
-                        st.text(raw[:1000] + "..." if len(raw) > 1000 else raw)
+                        # --- PAS DE DOUBLE CHECK (Direct Exécution) ---
+                        st.session_state.messages.append(as_model_call(call))
+                        
+                        # Debug UI
+                        args = dict(call.args or {})
+                        with st.chat_message("assistant"):
+                            with st.expander(f"🛠️ Debug Requête : {call.name}", expanded=False):
+                                if "query" in args: st.code(args["query"], language="sql")
+                                else: st.json(args)
+                        
+                        # Appel réel avec Timeout
+                        try:
+                            result = await asyncio.wait_for(session.call_tool(call.name, args), timeout=60.0)
+                            raw = result.content[0].text if result.content else "Aucune donnée."
+                        except asyncio.TimeoutError:
+                            raw = "ERREUR TIMEOUT : La requête est trop lourde."
+                        except Exception as e:
+                            raw = f"ERREUR OUTIL : {str(e)}"
+                        
+                        # Debug Résultat
+                        with st.chat_message("assistant"):
+                            with st.expander("📊 Debug Réponse brute", expanded=False):
+                                st.text(raw[:1000] + "..." if len(raw) > 1000 else raw)
 
-                st.session_state.messages.append(as_tool_resp(call.name, raw))
-            
-            return "Je n'ai pas réussi à conclure après plusieurs recherches."
+                        st.session_state.messages.append(as_tool_resp(call.name, raw))
+                    
+                    return "J'ai atteint la limite de mes recherches."
+
+        except Exception as e:
+            # === GESTION DE L'ERREUR TASKGROUP (AUTO-REPAIR) ===
+            if attempt < MAX_RETRIES - 1:
+                st.toast(f"⚠️ Instabilité serveur (Tentative {attempt+1}/{MAX_RETRIES}). Redémarrage...", icon="🔄")
+                await asyncio.sleep(2) # On laisse le temps au système de nettoyer le port
+                continue # On relance la boucle, ce qui relance le processus Python
+            else:
+                return f"❌ Erreur critique persistante après {MAX_RETRIES} essais : {str(e)}"
 
 # ======================
 # 8. INTERFACE
@@ -271,8 +290,7 @@ def _load_tools():
 try:
     tools = _load_tools()
 except Exception as e:
-    st.error(f"Impossible de charger les outils : {e}")
-    st.stop()
+    pass
 
 st.markdown('<div class="glass">', unsafe_allow_html=True)
 
@@ -291,7 +309,7 @@ if user_q:
         try:
             answer = asyncio.run(run_agent_turn(user_q, client))
         except Exception as e:
-            answer = f"❌ Erreur critique : {e}"
+            answer = f"❌ Erreur irrécupérable : {e}"
             
     st.session_state.history.append(("assistant", answer))
     with st.chat_message("assistant"):
