@@ -5,7 +5,6 @@ import asyncio
 import subprocess
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
-import re
 
 import streamlit as st
 from google import genai
@@ -14,7 +13,7 @@ from mcp import ClientSession
 from mcp.client.stdio import stdio_client, StdioServerParameters
 
 # ======================
-# 1. CONFIGURATION
+# 1. CONFIGURATION SÉCURISÉE
 # ======================
 try:
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
@@ -32,13 +31,13 @@ try:
     GEMINI_MODEL = "gemini-2.5-flash"
 
 except (FileNotFoundError, KeyError):
-    st.error("❌ ERREUR SÉCURITÉ : Fichier secrets.toml introuvable.")
+    st.error("❌ ERREUR SÉCURITÉ : Fichier secrets.toml introuvable ou incomplet.")
     st.stop()
 
 # ======================
-# 2. CERVEAU
+# 2. CERVEAU "SMART DATES" (La mise à jour est ici 🧠)
 # ======================
-CURRENT_DATE = datetime.now().strftime("%Y-%m-%d")
+CURRENT_DATE = datetime.now().strftime("%Y-%m-%d") # Format ISO pour aider l'IA
 
 SYSTEM_INSTRUCTION = f"""
 CONTEXTE :
@@ -75,7 +74,7 @@ RÈGLES D'ANALYSE :
 """
 
 # ======================
-# 3. UI SETUP
+# 3. STYLE & UI
 # ======================
 st.set_page_config(page_title="Ad's up — GAds Agent", page_icon="⚡", layout="wide")
 st.markdown("""
@@ -123,9 +122,15 @@ def extract_tool_call(resp):
             if part.function_call: return part.function_call
     return None
 
-def as_user(text: str) -> gt.Content: return gt.Content(role="user", parts=[gt.Part(text=text)])
-def as_model_text(text: str) -> gt.Content: return gt.Content(role="model", parts=[gt.Part(text=text)])
-def as_model_call(call) -> gt.Content: return gt.Content(role="model", parts=[gt.Part(function_call=call)])
+def as_user(text: str) -> gt.Content:
+    return gt.Content(role="user", parts=[gt.Part(text=text)])
+
+def as_model_text(text: str) -> gt.Content:
+    return gt.Content(role="model", parts=[gt.Part(text=text)])
+
+def as_model_call(call) -> gt.Content:
+    return gt.Content(role="model", parts=[gt.Part(function_call=call)])
+
 def as_tool_resp(name: str, resp) -> gt.Content:
     if not isinstance(resp, dict): resp = {"raw": str(resp)}
     return gt.Content(role="tool", parts=[gt.Part(function_response={"name": name, "response": resp})])
@@ -134,7 +139,7 @@ def trim_history(msgs: List[gt.Content], keep_last: int = 20):
     if len(msgs) > keep_last: del msgs[:-keep_last]
 
 # ======================
-# 5. SERVER CONFIG
+# 5. CONFIGURATION MCP
 # ======================
 def _build_server_params() -> StdioServerParameters:
     if not os.path.exists(MCP_SCRIPT_PATH):
@@ -142,7 +147,12 @@ def _build_server_params() -> StdioServerParameters:
              return StdioServerParameters(command=sys.executable, args=["-u", "server_ads.py"], env=ADS_CREDENTIALS)
         st.error(f"❌ Script introuvable : `{MCP_SCRIPT_PATH}`")
         st.stop()
-    return StdioServerParameters(command=sys.executable, args=["-u", MCP_SCRIPT_PATH], env=ADS_CREDENTIALS)
+        
+    return StdioServerParameters(
+        command=sys.executable, 
+        args=["-u", MCP_SCRIPT_PATH], 
+        env=ADS_CREDENTIALS,
+    )
 
 SERVER_PARAMS = _build_server_params()
 
@@ -165,149 +175,76 @@ async def list_mcp_tools() -> List[gt.Tool]:
                 ]
                 return tools
     except Exception as e:
+        st.error(f"Erreur connexion MCP : {e}")
         return []
 
 # ======================
-# 7. SUPERVISEUR IA (Avec Mémoire)
-# ======================
-def ai_check_query(client: genai.Client, history_messages: list, query: str) -> tuple[bool, str]:
-    """Vérifie la cohérence de la requête avec l'historique."""
-    context_text = ""
-    for msg in history_messages[-6:]:
-        role = "USER" if msg.role == "user" else "ASSISTANT"
-        content = ""
-        if msg.parts:
-            for part in msg.parts:
-                if part.text: content += part.text
-        context_text += f"{role}: {content}\n"
-
-    supervisor_prompt = f"""
-    CONTEXTE :
-    {context_text}
-    
-    REQUÊTE PROPOSÉE : "{query}"
-    
-    MISSION : Valider la cohérence.
-    
-    CRITÈRES :
-    1. Si l'user demande "Mots-clés", il faut `keyword_view` ET `ad_group_criterion.keyword.text`.
-    2. Si l'user dit "oui" ou "vas-y", c'est cohérent avec la proposition précédente -> VALIDE.
-    3. Présence de date et tri.
-
-    RÉPONSE JSON : {{ "valid": true, "reason": "OK" }} OU {{ "valid": false, "reason": "..." }}
-    """
-    
-    try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=supervisor_prompt,
-            config=gt.GenerateContentConfig(response_mime_type="application/json")
-        )
-        result = json.loads(response.text)
-        return result["valid"], result["reason"]
-    except Exception:
-        return True, "Check Skipped"
-
-# ======================
-# 8. MOTEUR AGENTIQUE (Auto-Repair + Correction)
+# 7. MOTEUR AGENTIQUE (Boucle Intelligente)
 # ======================
 async def run_agent_turn(user_q: str, client: genai.Client) -> str:
     st.session_state.messages.append(as_user(user_q))
 
-    MAX_RETRIES = 3
-    for attempt in range(MAX_RETRIES):
-        try:
-            async with stdio_client(SERVER_PARAMS) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    tl = await session.list_tools()
-                    tools_def = [
-                        gt.Tool(function_declarations=[{
-                            "name": t.name,
-                            "description": t.description or "",
-                            "parameters": {"type": "object", "properties": {}},
-                        }]) for t in tl.tools
-                    ]
+    async with stdio_client(SERVER_PARAMS) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            tl = await session.list_tools()
+            tools_def = [
+                gt.Tool(function_declarations=[{
+                    "name": t.name,
+                    "description": t.description or "",
+                    "parameters": {"type": "object", "properties": {}},
+                }]) for t in tl.tools
+            ]
 
-                    # Boucle de réflexion (5 tours)
-                    for _ in range(5):
-                        resp = client.models.generate_content(
-                            model=GEMINI_MODEL,
-                            contents=st.session_state.messages,
-                            config=gt.GenerateContentConfig(temperature=0.3, tools=tools_def, system_instruction=SYSTEM_INSTRUCTION),
-                        )
+            # Boucle de réflexion (5 itérations max)
+            for _ in range(5):
+                
+                resp = client.models.generate_content(
+                    model=GEMINI_MODEL,
+                    contents=st.session_state.messages,
+                    config=gt.GenerateContentConfig(
+                        temperature=0.3, # Créativité basse pour la rigueur SQL
+                        tools=tools_def,
+                        system_instruction=SYSTEM_INSTRUCTION
+                    ),
+                )
 
-                        call = extract_tool_call(resp)
-                        
-                        if not call:
-                            text = extract_text(resp)
-                            st.session_state.messages.append(as_model_text(text))
-                            trim_history(st.session_state.messages)
-                            return text
+                call = extract_tool_call(resp)
+                
+                if not call:
+                    text = extract_text(resp)
+                    st.session_state.messages.append(as_model_text(text))
+                    trim_history(st.session_state.messages)
+                    return text
 
-                        # --- SUPERVISION ---
-                        args = dict(call.args or {})
+                st.session_state.messages.append(as_model_call(call))
+                
+                # --- MOUCHARD DEBUG (Visible pour vous) ---
+                args = dict(call.args or {})
+                with st.chat_message("assistant"):
+                    with st.expander(f"🛠️ Debug Requête : {call.name}", expanded=False):
                         if "query" in args:
-                            with st.status("👮‍♂️ Supervision...", expanded=False) as status:
-                                is_valid, reason = ai_check_query(client, st.session_state.messages, args["query"])
-                                
-                                if not is_valid:
-                                    status.update(label=f"⚠️ Auto-Correction : {reason}", state="running")
-                                    
-                                    # Feedback coercitif pour forcer la correction
-                                    correction_msg = f"""
-                                    ⛔ REQUÊTE REFUSÉE PAR L'AUDITEUR.
-                                    Raison : {reason}
-                                    
-                                    ACTION REQUISE :
-                                    1. Ne t'excuse pas.
-                                    2. Corrige la requête SQL immédiatement en suivant la consigne.
-                                    3. Renvoie le JSON de l'outil corrigé.
-                                    """
-                                    
-                                    st.session_state.messages.append(as_model_call(call))
-                                    st.session_state.messages.append(as_tool_resp(call.name, correction_msg))
-                                    continue # On reboucle immédiatement
-                                else:
-                                    status.update(label="✅ Validé", state="complete")
+                            st.code(args["query"], language="sql")
+                        else:
+                            st.json(args)
+                
+                try:
+                    result = await session.call_tool(call.name, args)
+                    raw = result.content[0].text if result.content else "Aucune donnée."
+                except Exception as e:
+                    raw = f"Erreur outil: {str(e)}"
+                
+                # --- MOUCHARD RÉSULTAT (Visible pour vous) ---
+                with st.chat_message("assistant"):
+                    with st.expander("📊 Debug Réponse brute", expanded=False):
+                        st.text(raw[:1000] + "..." if len(raw) > 1000 else raw)
 
-                        # Exécution Validée
-                        st.session_state.messages.append(as_model_call(call))
-                        
-                        # Debug UI
-                        with st.chat_message("assistant"):
-                            with st.expander(f"🛠️ Exécution : {call.name}", expanded=False):
-                                if "query" in args: st.code(args["query"], language="sql")
-                                else: st.json(args)
-
-                        # Appel réel
-                        try:
-                            result = await asyncio.wait_for(session.call_tool(call.name, args), timeout=60.0)
-                            raw = result.content[0].text if result.content else "Aucune donnée."
-                        except asyncio.TimeoutError:
-                            raw = "ERREUR : Timeout."
-                        except Exception as e:
-                            raw = f"ERREUR OUTIL : {str(e)}"
-
-                        # Debug Résultat
-                        with st.chat_message("assistant"):
-                            with st.expander("📊 Résultat brut", expanded=False):
-                                st.text(raw[:1000] + "..." if len(raw) > 1000 else raw)
-
-                        st.session_state.messages.append(as_tool_resp(call.name, raw))
-                    
-                    return "J'ai atteint la limite de mes recherches."
-
-        except Exception as e:
-            if attempt < MAX_RETRIES - 1:
-                st.toast(f"⚠️ Micro-coupure serveur (Tentative {attempt+1}). Reconnexion...", icon="🔄")
-                await asyncio.sleep(1)
-                continue
-            else:
-                return f"Erreur critique : {str(e)}"
+                st.session_state.messages.append(as_tool_resp(call.name, raw))
+            
+            return "Je n'ai pas réussi à conclure après plusieurs recherches."
 
 # ======================
-# 9. INTERFACE
+# 8. INTERFACE
 # ======================
 
 st.markdown(f"""
@@ -334,18 +271,19 @@ def _load_tools():
 try:
     tools = _load_tools()
 except Exception as e:
-    pass
+    st.error(f"Impossible de charger les outils : {e}")
+    st.stop()
 
 st.markdown('<div class="glass">', unsafe_allow_html=True)
 
 for role, msg in st.session_state.history:
     with st.chat_message("user" if role == "user" else "assistant"):
-        st.markdown(msg["content"])
+        st.markdown(msg)
 
 user_q = st.chat_input("Ex: Coût des 2 derniers mois ? Pourquoi ça baisse ?")
 
 if user_q:
-    st.session_state.history.append({"role": "user", "content": user_q})
+    st.session_state.history.append(("user", user_q))
     with st.chat_message("user"):
         st.markdown(user_q)
         
@@ -353,9 +291,9 @@ if user_q:
         try:
             answer = asyncio.run(run_agent_turn(user_q, client))
         except Exception as e:
-            answer = f"❌ Erreur irrécupérable : {e}"
+            answer = f"❌ Erreur critique : {e}"
             
-    st.session_state.history.append({"role": "assistant", "content": answer})
+    st.session_state.history.append(("assistant", answer))
     with st.chat_message("assistant"):
         st.markdown(answer)
 
