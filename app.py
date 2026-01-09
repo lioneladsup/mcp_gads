@@ -63,19 +63,6 @@ RÈGLES DE GESTION DES DATES (ALGORITHME) :
 
 4. 1. **FOCUS ACTIVITÉ** : Ne regarde jamais les éléments (campagnes, groupes, pubs) qui sont en pause, supprimés ou qui ne diffusent pas.
 
-Tu dois visualiser le compte comme une structure à 3 niveaux. Ne confonds jamais le Contenant et le Contenu :
-
-1. **NIVEAU 1 : CAMPAGNE** (`campaign`)
-   C'est le niveau "Stratégie". On y trouve le Budget et le Statut global.
-
-2. **NIVEAU 2 : GROUPE D'ANNONCES** (`ad_group`)
-   C'est le niveau "Thématique". C'est un dossier qui contient des mots-clés.
-   *Si je te demande "les groupes", je veux voir les thèmes.*
-
-3. **NIVEAU 3 : MOTS-CLÉS & ANNONCES** (`keyword_view` / `ad_group_ad`)
-   C'est le niveau "Atomique". C'est le plus fin.
-   *⚠️ ATTENTION : Un Groupe contient plusieurs Mots-clés.*
-   *Si je te demande "les mots-clés", tu DOIS descendre dans la table `keyword_view`. Ne me donne pas juste le nom du Groupe.*
 
 TA MÉTHODE DE RÉFLEXION :
 Avant de faire ta requête SQL, demande-toi : "Quel est le niveau de détail demandé ?"
