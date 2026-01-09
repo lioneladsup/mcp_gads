@@ -5,6 +5,7 @@ import asyncio
 import subprocess
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
+import re
 
 import streamlit as st
 from google import genai
@@ -35,9 +36,9 @@ except (FileNotFoundError, KeyError):
     st.stop()
 
 # ======================
-# 2. CERVEAU "SMART DATES" (La mise à jour est ici 🧠)
+# 2. CERVEAU "SMART DATES" (VOTRE PROMPT INCHANGÉ)
 # ======================
-CURRENT_DATE = datetime.now().strftime("%Y-%m-%d") # Format ISO pour aider l'IA
+CURRENT_DATE = datetime.now().strftime("%Y-%m-%d")
 
 SYSTEM_INSTRUCTION = f"""
 CONTEXTE :
@@ -61,8 +62,7 @@ RÈGLES DE GESTION DES DATES (ALGORITHME) :
 
 3. **Défaut** : Si aucune date n'est précisée, utilise `LAST_30_DAYS`.
 
-4. 1. **FOCUS ACTIVITÉ** : Ne regarde jamais les éléments (campagnes, groupes, pubs) qui sont en pause, supprimés ou qui ne diffusent pas.
-
+4. **FOCUS ACTIVITÉ** : Ne regarde jamais les éléments (campagnes, groupes, pubs) qui sont en pause, supprimés ou qui ne diffusent pas.
 
 TA MÉTHODE DE RÉFLEXION :
 Avant de faire ta requête SQL, demande-toi : "Quel est le niveau de détail demandé ?"
@@ -176,76 +176,154 @@ async def list_mcp_tools() -> List[gt.Tool]:
                 ]
                 return tools
     except Exception as e:
-        st.error(f"Erreur connexion MCP : {e}")
         return []
 
 # ======================
-# 7. MOTEUR AGENTIQUE (Boucle Intelligente)
+# 7. LE SUPERVISEUR IA (Validation Intelligente) 👮‍♂️
+# ======================
+def ai_check_query(client: genai.Client, user_q: str, query: str) -> tuple[bool, str]:
+    """
+    Envoie la requête et la question à une instance légère de Gemini pour validation.
+    """
+    
+    supervisor_prompt = f"""
+    Tu es un Auditeur Expert GAQL (Google Ads Query Language).
+    
+    1. DEMANDE UTILISATEUR : "{user_q}"
+    2. REQUÊTE GÉNÉRÉE : "{query}"
+    
+    TA MISSION : Vérifier la cohérence.
+    
+    CRITÈRES DE VALIDATION :
+    - Si l'utilisateur demande "Mots-clés", la requête DOIT contenir `keyword_view` et `ad_group_criterion.keyword.text`.
+    - Si l'utilisateur demande "Termes de recherche", la requête DOIT contenir `search_term_view`.
+    - La période de temps (DATE) est-elle logique par rapport à la demande ? (ex: pas de "last year" si on demande "hier").
+    - La requête a-t-elle un `ORDER BY` ?
+    
+    RÉPONSE ATTENDUE (JSON STRICT) :
+    {{
+        "valid": true,
+        "reason": "OK"
+    }}
+    OU
+    {{
+        "valid": false,
+        "reason": "Explique ici pourquoi la requête ne répond pas à la question utilisateur."
+    }}
+    """
+    
+    try:
+        # On utilise Flash pour que ce soit ultra rapide
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=supervisor_prompt,
+            config=gt.GenerateContentConfig(response_mime_type="application/json")
+        )
+        result = json.loads(response.text)
+        return result["valid"], result["reason"]
+    except Exception:
+        # Si le superviseur échoue, on laisse passer (fail-open) pour ne pas bloquer l'app
+        return True, "Check Skipped"
+
+# ======================
+# 8. MOTEUR AGENTIQUE (Auto-Repair + Superviseur) 🛡️
 # ======================
 async def run_agent_turn(user_q: str, client: genai.Client) -> str:
     st.session_state.messages.append(as_user(user_q))
 
-    async with stdio_client(SERVER_PARAMS) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            tl = await session.list_tools()
-            tools_def = [
-                gt.Tool(function_declarations=[{
-                    "name": t.name,
-                    "description": t.description or "",
-                    "parameters": {"type": "object", "properties": {}},
-                }]) for t in tl.tools
-            ]
+    # Gestion du redémarrage automatique (Retry Loop)
+    MAX_RETRIES = 3
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            async with stdio_client(SERVER_PARAMS) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    
+                    # Reload tools
+                    tl = await session.list_tools()
+                    tools_def = [
+                        gt.Tool(function_declarations=[{
+                            "name": t.name,
+                            "description": t.description or "",
+                            "parameters": {"type": "object", "properties": {}},
+                        }]) for t in tl.tools
+                    ]
 
-            # Boucle de réflexion (5 itérations max)
-            for _ in range(5):
-                
-                resp = client.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=st.session_state.messages,
-                    config=gt.GenerateContentConfig(
-                        temperature=0.3, # Créativité basse pour la rigueur SQL
-                        tools=tools_def,
-                        system_instruction=SYSTEM_INSTRUCTION
-                    ),
-                )
+                    # Boucle de réflexion (5 tours max)
+                    for _ in range(5):
+                        
+                        resp = client.models.generate_content(
+                            model=GEMINI_MODEL,
+                            contents=st.session_state.messages,
+                            config=gt.GenerateContentConfig(
+                                temperature=0.3, 
+                                tools=tools_def,
+                                system_instruction=SYSTEM_INSTRUCTION
+                            ),
+                        )
 
-                call = extract_tool_call(resp)
-                
-                if not call:
-                    text = extract_text(resp)
-                    st.session_state.messages.append(as_model_text(text))
-                    trim_history(st.session_state.messages)
-                    return text
+                        call = extract_tool_call(resp)
+                        
+                        if not call:
+                            text = extract_text(resp)
+                            st.session_state.messages.append(as_model_text(text))
+                            trim_history(st.session_state.messages)
+                            return text
 
-                st.session_state.messages.append(as_model_call(call))
-                
-                # --- MOUCHARD DEBUG (Visible pour vous) ---
-                args = dict(call.args or {})
-                with st.chat_message("assistant"):
-                    with st.expander(f"🛠️ Debug Requête : {call.name}", expanded=False):
+                        # --- PHASE DE SUPERVISION IA ---
+                        args = dict(call.args or {})
                         if "query" in args:
-                            st.code(args["query"], language="sql")
-                        else:
-                            st.json(args)
-                
-                try:
-                    result = await session.call_tool(call.name, args)
-                    raw = result.content[0].text if result.content else "Aucune donnée."
-                except Exception as e:
-                    raw = f"Erreur outil: {str(e)}"
-                
-                # --- MOUCHARD RÉSULTAT (Visible pour vous) ---
-                with st.chat_message("assistant"):
-                    with st.expander("📊 Debug Réponse brute", expanded=False):
-                        st.text(raw[:1000] + "..." if len(raw) > 1000 else raw)
+                            with st.status("👮‍♂️ Supervision de la requête...", expanded=False) as status:
+                                is_valid, reason = ai_check_query(client, user_q, args["query"])
+                                
+                                if not is_valid:
+                                    status.update(label=f"❌ Rejeté : {reason}", state="error")
+                                    # On renvoie l'erreur à l'agent principal
+                                    st.session_state.messages.append(as_model_call(call))
+                                    st.session_state.messages.append(as_tool_resp(call.name, f"REFUSÉ PAR LE SUPERVISEUR : {reason}. Corrige la requête SQL."))
+                                    continue # On saute l'exécution et on laisse Gemini réessayer
+                                else:
+                                    status.update(label="✅ Validé", state="complete")
 
-                st.session_state.messages.append(as_tool_resp(call.name, raw))
-            
-            return "Je n'ai pas réussi à conclure après plusieurs recherches."
+                        # Exécution Validée
+                        st.session_state.messages.append(as_model_call(call))
+                        
+                        # Debug UI
+                        with st.chat_message("assistant"):
+                            with st.expander(f"🛠️ Debug Requête : {call.name}", expanded=False):
+                                if "query" in args: st.code(args["query"], language="sql")
+                                else: st.json(args)
+                        
+                        # Appel réel (Timeout 60s)
+                        try:
+                            result = await asyncio.wait_for(session.call_tool(call.name, args), timeout=60.0)
+                            raw = result.content[0].text if result.content else "Aucune donnée."
+                        except asyncio.TimeoutError:
+                            raw = "ERREUR TIMEOUT : La requête est trop lourde."
+                        except Exception as e:
+                            raw = f"ERREUR OUTIL : {str(e)}"
+                        
+                        # Debug Résultat
+                        with st.chat_message("assistant"):
+                            with st.expander("📊 Debug Réponse brute", expanded=False):
+                                st.text(raw[:1000] + "..." if len(raw) > 1000 else raw)
+
+                        st.session_state.messages.append(as_tool_resp(call.name, raw))
+                    
+                    return "J'ai atteint la limite de mes recherches."
+
+        except Exception as e:
+            # Gestion du Crash Serveur
+            if attempt < MAX_RETRIES - 1:
+                st.toast(f"⚠️ Micro-coupure serveur (Tentative {attempt+1}). Reconnexion...", icon="🔄")
+                await asyncio.sleep(1)
+                continue
+            else:
+                return f"Erreur critique après plusieurs essais : {str(e)}"
 
 # ======================
-# 8. INTERFACE
+# 9. INTERFACE
 # ======================
 
 st.markdown(f"""
@@ -272,8 +350,7 @@ def _load_tools():
 try:
     tools = _load_tools()
 except Exception as e:
-    st.error(f"Impossible de charger les outils : {e}")
-    st.stop()
+    pass
 
 st.markdown('<div class="glass">', unsafe_allow_html=True)
 
@@ -292,7 +369,7 @@ if user_q:
         try:
             answer = asyncio.run(run_agent_turn(user_q, client))
         except Exception as e:
-            answer = f"❌ Erreur critique : {e}"
+            answer = f"❌ Erreur irrécupérable : {e}"
             
     st.session_state.history.append(("assistant", answer))
     with st.chat_message("assistant"):
