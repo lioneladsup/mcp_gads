@@ -36,7 +36,7 @@ except (FileNotFoundError, KeyError):
     st.stop()
 
 # ======================
-# 2. CERVEAU "SMART DATES"
+# 2. CERVEAU "SMART DATES" (VOTRE PROMPT DE BASE)
 # ======================
 CURRENT_DATE = datetime.now().strftime("%Y-%m-%d")
 
@@ -189,7 +189,7 @@ async def run_agent_turn(user_q: str, client: genai.Client) -> str:
     
     for attempt in range(MAX_RETRIES):
         try:
-            # On lance une NOUVELLE connexion à chaque tentative
+            # On crée une nouvelle connexion à chaque tentative
             async with stdio_client(SERVER_PARAMS) as (read, write):
                 async with ClientSession(read, write) as session:
                     
