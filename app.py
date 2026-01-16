@@ -32,8 +32,12 @@ try:
     GEMINI_MODEL = "gemini-2.5-flash"
 
 except (FileNotFoundError, KeyError):
-    st.error("❌ ERREUR SÉCURITÉ : Fichier secrets.toml introuvable ou incomplet.")
-    st.stop()
+    # FALLBACK LOCAL (Si pas de secrets.toml)
+    st.warning("⚠️ Mode Local (Clés en dur utilisées)")
+    # Remplir ici si besoin pour tester sans secrets.toml
+    GEMINI_API_KEY = "VOTRE_CLE_ICI" 
+    MCP_SCRIPT_PATH = r"C:\Users\lione\server_ads.py"
+    # ... (Ajoutez vos clés ADS_CREDENTIALS ici si nécessaire en fallback)
 
 # ======================
 # 2. CERVEAU "SMART DATES"
@@ -43,7 +47,7 @@ CURRENT_DATE = datetime.now().strftime("%Y-%m-%d")
 SYSTEM_INSTRUCTION = f"""
 CONTEXTE :
 Nous sommes le : {CURRENT_DATE} (Année-Mois-Jour).
-Compte analysé : {ADS_CREDENTIALS['GOOGLE_ADS_CUSTOMER_ID']}
+Compte analysé : {ADS_CREDENTIALS.get('GOOGLE_ADS_CUSTOMER_ID', 'Inconnu')}
 
 TON RÔLE :
 Tu es un Stratège Google Ads Senior. Tu es autonome dans tes recherches et ton interprétation.
@@ -66,7 +70,7 @@ RÈGLES DE GESTION DES DATES (ALGORITHME) :
 
 TA MÉTHODE DE RÉFLEXION :
 Avant de faire ta requête SQL, demande-toi : "Quel est le niveau de détail demandé ?"
-- Si c'est "Mot-clé", ta requête SQL **DOIT** interroger la vue mot-clé pour obtenir le texte exact du mot, pas juste le nom du groupe parent.
+- Si c'est "Mot-clé", ta requête SQL **DOIT** interroger la vue mot-clé (`keyword_view`) et demander le texte (`ad_group_criterion.keyword.text`).
 
 RÈGLES D'ANALYSE :
 - Divise toujours `metrics.cost_micros` par 1 000 000.
@@ -144,6 +148,7 @@ def trim_history(msgs: List[gt.Content], keep_last: int = 20):
 # ======================
 def _build_server_params() -> StdioServerParameters:
     if not os.path.exists(MCP_SCRIPT_PATH):
+        # Fallback pour le Cloud (si chemin relatif)
         if os.path.exists("server_ads.py"):
              return StdioServerParameters(command=sys.executable, args=["-u", "server_ads.py"], env=ADS_CREDENTIALS)
         st.error(f"❌ Script introuvable : `{MCP_SCRIPT_PATH}`")
@@ -179,21 +184,22 @@ async def list_mcp_tools() -> List[gt.Tool]:
         return []
 
 # ======================
-# 7. MOTEUR AGENTIQUE (AUTO-RESTART INTÉGRÉ) 🔄
+# 7. MOTEUR AGENTIQUE (AUTO-REPAIR + NO CRASH) 🛡️
 # ======================
 async def run_agent_turn(user_q: str, client: genai.Client) -> str:
     st.session_state.messages.append(as_user(user_q))
 
-    # --- MÉCANISME DE REDÉMARRAGE AUTOMATIQUE ---
+    # --- MÉCANISME DE REDÉMARRAGE AUTOMATIQUE (MAX 3 essais) ---
     MAX_RETRIES = 3
     
     for attempt in range(MAX_RETRIES):
         try:
-            # On crée une nouvelle connexion à chaque tentative
+            # On lance une NOUVELLE connexion à chaque tentative (Processus frais)
             async with stdio_client(SERVER_PARAMS) as (read, write):
                 async with ClientSession(read, write) as session:
                     
                     await session.initialize()
+                    # On recharge les outils pour vérifier la connexion
                     tl = await session.list_tools()
                     
                     tools_def = [
@@ -204,7 +210,7 @@ async def run_agent_turn(user_q: str, client: genai.Client) -> str:
                         }]) for t in tl.tools
                     ]
 
-                    # Boucle de réflexion (5 étapes max)
+                    # --- BOUCLE DE RÉFLEXION IA (5 étapes max) ---
                     for _ in range(5):
                         
                         resp = client.models.generate_content(
@@ -219,23 +225,24 @@ async def run_agent_turn(user_q: str, client: genai.Client) -> str:
 
                         call = extract_tool_call(resp)
                         
+                        # Si l'IA répond par du texte (fini)
                         if not call:
                             text = extract_text(resp)
                             st.session_state.messages.append(as_model_text(text))
                             trim_history(st.session_state.messages)
                             return text
 
-                        # --- PAS DE DOUBLE CHECK (Direct Exécution) ---
+                        # --- EXÉCUTION DIRECTE (Pas de double check) ---
                         st.session_state.messages.append(as_model_call(call))
                         
-                        # Debug UI
+                        # Debug UI (Accordeon)
                         args = dict(call.args or {})
                         with st.chat_message("assistant"):
                             with st.expander(f"🛠️ Debug Requête : {call.name}", expanded=False):
                                 if "query" in args: st.code(args["query"], language="sql")
                                 else: st.json(args)
                         
-                        # Appel réel avec Timeout
+                        # APPEL RÉEL (Avec Timeout de sécurité)
                         try:
                             result = await asyncio.wait_for(session.call_tool(call.name, args), timeout=60.0)
                             raw = result.content[0].text if result.content else "Aucune donnée."
@@ -254,12 +261,12 @@ async def run_agent_turn(user_q: str, client: genai.Client) -> str:
                     return "J'ai atteint la limite de mes recherches."
 
         except Exception as e:
-            # === GESTION DE L'ERREUR TASKGROUP (AUTO-REPAIR) ===
-            # C'est ici que le redémarrage automatique opère
+            # === GESTION DU CRASH (TaskGroup / BrokenPipe) ===
+            # Si le serveur plante, on arrive ici
             if attempt < MAX_RETRIES - 1:
                 st.toast(f"⚠️ Instabilité serveur (Tentative {attempt+1}/{MAX_RETRIES}). Redémarrage...", icon="🔄")
-                await asyncio.sleep(2) # On laisse le temps au système de nettoyer le port
-                continue # On relance la boucle, ce qui relance le processus Python
+                await asyncio.sleep(2) # On laisse 2s au système pour nettoyer le port
+                continue # On remonte au début du 'for', ce qui crée une nouvelle connexion
             else:
                 return f"❌ Erreur critique persistante après {MAX_RETRIES} essais : {str(e)}"
 
@@ -274,7 +281,7 @@ st.markdown(f"""
     Pilotage Expert via Gemini Flash & MCP
   </div>
   <div class="chips" style="margin-top:10px;">
-    <span>Date: {datetime.now().strftime('%d/%m/%Y')}</span><span>Compte: {ADS_CREDENTIALS['GOOGLE_ADS_CUSTOMER_ID']}</span>
+    <span>Date: {datetime.now().strftime('%d/%m/%Y')}</span><span>Compte: {ADS_CREDENTIALS.get('GOOGLE_ADS_CUSTOMER_ID', '...')}</span>
   </div>
 </div>
 """, unsafe_allow_html=True)
@@ -295,13 +302,26 @@ except Exception as e:
 
 st.markdown('<div class="glass">', unsafe_allow_html=True)
 
-for role, msg in st.session_state.history:
-    with st.chat_message("user" if role == "user" else "assistant"):
-        st.markdown(msg)
+# --- CORRECTION DE L'AFFICHAGE HISTORIQUE (Pour éviter le bug "content") ---
+for message in st.session_state.history:
+    # On gère les deux formats possibles (dict ou tuple) pour la robustesse
+    if isinstance(message, dict):
+        role = message.get("role", "assistant")
+        content = message.get("content", "")
+    elif isinstance(message, tuple): # Ancien format au cas où
+        role = message[0]
+        content = message[1]
+    else:
+        continue # Format inconnu, on saute
+
+    avatar_style = "user" if role == "user" else "assistant"
+    with st.chat_message(avatar_style):
+        st.markdown(content)
 
 user_q = st.chat_input("Ex: Coût des 2 derniers mois ? Pourquoi ça baisse ?")
 
 if user_q:
+    # Sauvegarde User
     st.session_state.history.append({"role": "user", "content": user_q})
     with st.chat_message("user"):
         st.markdown(user_q)
@@ -311,7 +331,8 @@ if user_q:
             answer = asyncio.run(run_agent_turn(user_q, client))
         except Exception as e:
             answer = f"❌ Erreur irrécupérable : {e}"
-            
+    
+    # Sauvegarde Assistant
     st.session_state.history.append({"role": "assistant", "content": answer})
     with st.chat_message("assistant"):
         st.markdown(answer)
