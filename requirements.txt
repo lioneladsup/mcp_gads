@@ -1,5 +1,5 @@
-streamlit
+chainlit
 google-genai
-mcp
 google-ads
+mcp
 pandas

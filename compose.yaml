@@ -1,0 +1,6 @@
+services:
+  mcpgadsstreamlit:
+    image: mcpgadsstreamlit
+    build:
+      context: .
+      dockerfile: ./Dockerfile
